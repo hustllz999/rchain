@@ -7,7 +7,6 @@ import coop.rchain.blockstorage.BlockStore
 import coop.rchain.blockstorage.casperbuffer.CasperBufferStorage
 import coop.rchain.blockstorage.dag.BlockDagStorage
 import coop.rchain.blockstorage.deploy.DeployStorage
-import coop.rchain.blockstorage.finality.LastFinalizedStorage
 import coop.rchain.casper.LastApprovedBlock.LastApprovedBlock
 import coop.rchain.casper.ValidBlock.Valid
 import coop.rchain.casper._
@@ -22,8 +21,8 @@ import coop.rchain.comm.PeerNode
 import coop.rchain.comm.rp.Connect.{ConnectionsCell, RPConfAsk}
 import coop.rchain.comm.transport.TransportLayer
 import coop.rchain.metrics.{Metrics, Span}
-import coop.rchain.models.{BindPattern, ListParWithRandom, Par, TaggedContinuation}
 import coop.rchain.models.BlockHash.BlockHash
+import coop.rchain.models.{BindPattern, ListParWithRandom, Par, TaggedContinuation}
 import coop.rchain.rholang.interpreter.storage
 import coop.rchain.rspace.state.{RSpaceImporter, RSpaceStateManager}
 import coop.rchain.shared
@@ -42,8 +41,8 @@ class Initializing[F[_]
   /* Transport */   : TransportLayer: CommUtil: BlockRetriever: EventPublisher
   /* State */       : EngineCell: RPConfAsk: ConnectionsCell: LastApprovedBlock
   /* Rholang */     : RuntimeManager
-  /* Casper */      : Estimator: SafetyOracle: LastFinalizedBlockCalculator: LastFinalizedHeightConstraintChecker: SynchronyConstraintChecker
-  /* Storage */     : BlockStore: BlockDagStorage: LastFinalizedStorage: DeployStorage: CasperBufferStorage: RSpaceStateManager
+  /* Casper */      : Estimator: SafetyOracle: LastFinalizedHeightConstraintChecker: SynchronyConstraintChecker
+  /* Storage */     : BlockStore: BlockDagStorage: DeployStorage: CasperBufferStorage: RSpaceStateManager
   /* Diagnostics */ : Log: EventLog: Metrics: Span] // format: on
 (
     blockProcessingQueue: Queue[F, (Casper[F], BlockMessage)],
@@ -98,6 +97,9 @@ class Initializing[F[_]
               s"Valid approved block ${PrettyPrinter.buildString(block, short = true)} received. Restoring approved state."
             )
 
+        // Record approved block in DAG
+        _ <- BlockDagStorage[F].insert(block, invalid = false, approved = true)
+
         // Download approved state and all related blocks
         _ <- requestApprovedState(approvedBlock)
 
@@ -112,9 +114,6 @@ class Initializing[F[_]
                   .buildStringNoLimit(block.blockHash)
               )
             )
-
-        // Update last finalized block with received block hash
-        _ <- LastFinalizedStorage[F].put(block.blockHash)
 
         _ <- Log[F].info(
               s"Approved state for block ${PrettyPrinter.buildString(block, short = true)} is successfully restored."
@@ -165,10 +164,10 @@ class Initializing[F[_]
 
       // Request tuple space state for Last Finalized State
       stateValidator = {
-        implicit val codecPar  = storage.serializePar.toSizeHeadCodec
-        implicit val codecBind = storage.serializeBindPattern.toSizeHeadCodec
-        implicit val codecPars = storage.serializePars.toSizeHeadCodec
-        implicit val codecCont = storage.serializeTaggedContinuation.toSizeHeadCodec
+        implicit val codecPar  = storage.serializePar
+        implicit val codecBind = storage.serializeBindPattern
+        implicit val codecPars = storage.serializePars
+        implicit val codecCont = storage.serializeTaggedContinuation
         RSpaceImporter.validateStateItems[
           F,
           Par,

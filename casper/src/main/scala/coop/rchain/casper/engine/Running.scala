@@ -7,7 +7,7 @@ import cats.{Applicative, Monad}
 import com.google.protobuf.ByteString
 import coop.rchain.blockstorage.BlockStore
 import coop.rchain.blockstorage.casperbuffer.CasperBufferStorage
-import coop.rchain.blockstorage.finality.LastFinalizedStorage
+import coop.rchain.blockstorage.dag.BlockDagStorage
 import coop.rchain.casper._
 import coop.rchain.casper.engine.EngineCell.EngineCell
 import coop.rchain.casper.protocol._
@@ -19,7 +19,7 @@ import coop.rchain.comm.rp.Connect.{ConnectionsCell, RPConfAsk}
 import coop.rchain.comm.transport.TransportLayer
 import coop.rchain.metrics.{Metrics, MetricsSemaphore}
 import coop.rchain.models.BlockHash.BlockHash
-import coop.rchain.rspace.Blake2b256Hash
+import coop.rchain.rspace.hashing.Blake2b256Hash
 import coop.rchain.rspace.state.{RSpaceExporter, RSpaceStateManager}
 import fs2.concurrent.Queue
 import coop.rchain.shared.{Log, Time}
@@ -57,13 +57,15 @@ object Running {
       _ <- engine.withCasper(
             casper => {
               for {
-                tipHash      <- MultiParentCasper.forkChoiceTip[F](casper)
-                tip          <- BlockStore[F].getUnsafe(tipHash)
-                tipTimestamp = tip.header.timestamp
-                now          <- Time[F].currentMillis
-                expired      = (now - tipTimestamp) > delayThreshold.toMillis
+                latestMessages <- casper.blockDag.flatMap(
+                                   _.latestMessageHashes.map(_.values.toList)
+                                 )
+                tips            <- latestMessages.traverse(BlockStore[F].getUnsafe)
+                newestTimestamp = tips.map(_.header.timestamp).max
+                now             <- Time[F].currentMillis
+                expired         = (now - newestTimestamp) > delayThreshold.toMillis
                 requestWithLog = Log[F].info(
-                  "Updating fork choice tips as current FCT " +
+                  "Requesting tips update as newest latest message " +
                     s"is more then ${delayThreshold.toString} old. " +
                     s"Might be network is faulty."
                 ) >> CommUtil[F].sendForkChoiceTipRequest
@@ -168,19 +170,22 @@ object Running {
   /**
     * Peer asks for fork-choice tip
     */
+  // TODO name for this message is misleading, as its a request for all tips, not just fork choice.
   def handleForkChoiceTipRequest[F[_]: Sync: TransportLayer: RPConfAsk: BlockStore: Log](
       peer: PeerNode
   )(casper: MultiParentCasper[F]): F[Unit] = {
     val logRequest = Log[F].info(s"Received ForkChoiceTipRequest from ${peer.endpoint.host}")
-    def logResponse(blockHash: BlockHash) =
+    def logResponse(tips: Seq[BlockHash]): F[Unit] =
       Log[F].info(
-        s"Sending hash ${PrettyPrinter.buildString(blockHash)} to ${peer.endpoint.host}"
+        s"Sending tips ${PrettyPrinter.buildString(tips)} to ${peer.endpoint.host}"
       )
-    val getTip = MultiParentCasper.forkChoiceTip(casper)
-    def respondToPeer(tip: BlockHash) =
-      logResponse(tip) >> TransportLayer[F].sendToPeer(peer, HasBlockProto(tip))
+    val getTips = casper.blockDag.flatMap(_.latestMessageHashes.map(_.values.toList))
+    // TODO respond with all tips in a single message
+    def respondToPeer(tip: BlockHash) = TransportLayer[F].sendToPeer(peer, HasBlockProto(tip))
 
-    logRequest >> getTip >>= respondToPeer
+    logRequest >> getTips >>= { t =>
+      t.traverse(respondToPeer) >> logResponse(t)
+    }
   }
 
   /**
@@ -234,7 +239,7 @@ class Running[F[_]
   /* Execution */   : Concurrent: Time
   /* Transport */   : TransportLayer: CommUtil: BlockRetriever
   /* State */       : RPConfAsk: ConnectionsCell
-  /* Storage */     : BlockStore: LastFinalizedStorage: CasperBufferStorage: RSpaceStateManager
+  /* Storage */     : BlockStore: BlockDagStorage: CasperBufferStorage: RSpaceStateManager
   /* Diagnostics */ : Log: Metrics] // format: on
 (
     blockProcessingQueue: Queue[F, (Casper[F], BlockMessage)],
@@ -293,13 +298,10 @@ class Running[F[_]
       handleForkChoiceTipRequest(peer)(casper)
     case abr: ApprovedBlockRequest =>
       for {
-        lfBlockHashOpt <- LastFinalizedStorage[F].get()
+        lfBlockHash <- BlockDagStorage[F].getRepresentation.map(_.lastFinalizedBlock)
 
         // Create approved block from last finalized block
         lastFinalizedBlock = for {
-          lfBlockHash <- lfBlockHashOpt.liftTo[F](
-                          new Exception(s"Last finalized block hash not available.")
-                        )
           lfBlock <- BlockStore[F].getUnsafe(lfBlockHash)
 
           // Each approved block should be justified by validators signatures
@@ -313,7 +315,7 @@ class Running[F[_]
           )
         } yield lastApprovedBlock
 
-        approvedBlock <- if (abr.trimState && lfBlockHashOpt.isDefined)
+        approvedBlock <- if (abr.trimState)
                           // If Last Finalized State is requested return Last Finalized block as Approved block
                           lastFinalizedBlock
                         else

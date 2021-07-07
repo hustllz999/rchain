@@ -21,11 +21,10 @@ import com.google.protobuf.ByteString
 import coop.rchain.blockstorage.casperbuffer.CasperBufferStorage
 import coop.rchain.blockstorage.dag.BlockDagStorage
 import coop.rchain.blockstorage.deploy.DeployStorage
-import coop.rchain.blockstorage.finality.LastFinalizedStorage
 import coop.rchain.casper.state.RNodeStateManager
 import coop.rchain.casper.util.comm.CommUtil
 import coop.rchain.models.BlockHash.BlockHash
-import coop.rchain.rspace.Blake2b256Hash
+import coop.rchain.rspace.hashing.Blake2b256Hash
 import coop.rchain.rspace.state.RSpaceStateManager
 import fs2.concurrent.Queue
 
@@ -67,7 +66,7 @@ object Engine {
   ): F[Unit] =
     for {
       _ <- BlockStore[F].put(genesis.blockHash, genesis)
-      _ <- BlockDagStorage[F].insert(genesis, invalid = false)
+      _ <- BlockDagStorage[F].insert(genesis, invalid = false, approved = true)
       _ <- BlockStore[F].putApprovedBlock(approvedBlock)
     } yield ()
 
@@ -90,7 +89,7 @@ object Engine {
     /* Execution */   : Concurrent: Time
     /* Transport */   : TransportLayer: CommUtil: BlockRetriever: EventPublisher
     /* State */       : EngineCell: RPConfAsk: ConnectionsCell
-    /* Storage */     : BlockStore: LastFinalizedStorage: CasperBufferStorage: RSpaceStateManager
+    /* Storage */     : BlockStore: BlockDagStorage: CasperBufferStorage: RSpaceStateManager
     /* Diagnostics */ : Log: EventLog: Metrics] // format: on
   (
       blockProcessingQueue: Queue[F, (Casper[F], BlockMessage)],
@@ -100,9 +99,10 @@ object Engine {
       validatorId: Option[ValidatorIdentity],
       init: F[Unit],
       disableStateExporter: Boolean
-  ): F[Unit] =
+  ): F[Unit] = {
+    val approvedBlockInfo = PrettyPrinter.buildString(approvedBlock.candidate.block, short = true)
     for {
-      _ <- Log[F].info("Making a transition to Running state.")
+      _ <- Log[F].info(s"Making a transition to Running state. Approved $approvedBlockInfo")
       _ <- EventLog[F].publish(
             shared.Event.EnteredRunningState(
               PrettyPrinter.buildStringNoLimit(approvedBlock.candidate.block.blockHash)
@@ -120,6 +120,7 @@ object Engine {
       _ <- EngineCell[F].set(running)
 
     } yield ()
+  }
 
   // format: off
   def transitionToInitializing[F[_]
@@ -127,8 +128,8 @@ object Engine {
     /* Transport */   : TransportLayer: CommUtil: BlockRetriever: EventPublisher
     /* State */       : EngineCell: RPConfAsk: ConnectionsCell: LastApprovedBlock
     /* Rholang */     : RuntimeManager
-    /* Casper */      : Estimator: SafetyOracle: LastFinalizedBlockCalculator: LastFinalizedHeightConstraintChecker: SynchronyConstraintChecker
-    /* Storage */     : BlockStore: BlockDagStorage: LastFinalizedStorage: DeployStorage: CasperBufferStorage: RSpaceStateManager
+    /* Casper */      : Estimator: SafetyOracle: LastFinalizedHeightConstraintChecker: SynchronyConstraintChecker
+    /* Storage */     : BlockStore: BlockDagStorage: DeployStorage: CasperBufferStorage: RSpaceStateManager
     /* Diagnostics */ : Log: EventLog: Metrics: Span] // format: on
   (
       blockProcessingQueue: Queue[F, (Casper[F], BlockMessage)],

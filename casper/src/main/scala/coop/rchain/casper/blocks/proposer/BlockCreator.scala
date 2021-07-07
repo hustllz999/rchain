@@ -19,7 +19,7 @@ import coop.rchain.crypto.signatures.Signed
 import coop.rchain.metrics.{Metrics, Span}
 import coop.rchain.models.BlockHash.BlockHash
 import coop.rchain.rholang.interpreter.SystemProcesses.BlockData
-import coop.rchain.shared.{Log, Time}
+import coop.rchain.shared.{Log, Stopwatch, Time}
 
 object BlockCreator {
   private[this] val ProcessDeploysAndCreateBlockMetricsSource =
@@ -99,8 +99,7 @@ object BlockCreator {
         case None => Seq.empty[Signed[DeployData]]
       }
 
-      for {
-        now <- Time[F].currentMillis
+      val createBlockProcess = for {
         _ <- Log[F].info(
               s"Creating block #${nextBlockNum} (seqNum ${nextSeqNum})"
             )
@@ -158,6 +157,19 @@ object BlockCreator {
             else
               BlockCreatorResult.noNewDeploys.pure[F]
       } yield r
+
+      for {
+        // Create block and measure duration
+        r                      <- Stopwatch.duration(createBlockProcess)
+        (blockStatus, elapsed) = r
+        _ <- blockStatus match {
+              case Created(block) =>
+                val blockInfo   = PrettyPrinter.buildString(block, short = true)
+                val deployCount = block.body.deploys.size
+                Log[F].info(s"Block created: $blockInfo (${deployCount}d) [$elapsed]")
+              case _ => ().pure[F]
+            }
+      } yield blockStatus
     }
 
   private def packageBlock(
@@ -167,7 +179,7 @@ object BlockCreator {
       preStateHash: StateHash,
       postStateHash: StateHash,
       deploys: Seq[ProcessedDeploy],
-      rejectedDeploys: Seq[ProcessedDeploy],
+      rejectedDeploys: Seq[ByteString],
       systemDeploys: Seq[ProcessedSystemDeploy],
       bondsMap: Seq[Bond],
       shardId: String,
@@ -178,7 +190,7 @@ object BlockCreator {
       Body(
         state,
         deploys.toList,
-        rejectedDeploys.map(r => RejectedDeploy(r.deploy.sig)).toList,
+        rejectedDeploys.map(r => RejectedDeploy(r)).toList,
         systemDeploys.toList
       )
     val header = Header(parents.toList, blockData.timeStamp, version)

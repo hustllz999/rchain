@@ -1,6 +1,6 @@
 package coop.rchain.casper.api
 
-import cats.effect.{Resource, Sync}
+import cats.effect.{Concurrent, Resource, Sync}
 import cats.syntax.all._
 import com.google.protobuf.ByteString
 import coop.rchain.blockstorage.BlockStore
@@ -23,6 +23,7 @@ import coop.rchain.shared.{Cell, Log}
 import monix.eval.Task
 import monix.execution.Scheduler.Implicits.global
 import org.scalatest._
+import coop.rchain.models.syntax._
 
 import scala.collection.immutable.HashMap
 
@@ -59,10 +60,11 @@ class BlockQueryResponseAPITest
       setValidator = sender.some,
       setDeploys = randomDeploys.some,
       setJustifications = List(Justification(bondsValidator.validator, genesisBlock.blockHash)).some,
+      setParentsHashList = List(genesisBlock.blockHash).some,
       setBonds = List(bondsValidator).some
     )
 
-  val faultTolerance = 1f
+  val faultTolerance = SafetyOracle.MIN_FAULT_TOLERANCE
 
   val deployCostList: List[String] = randomDeploys.map(PrettyPrinter.buildString)
 
@@ -74,7 +76,7 @@ class BlockQueryResponseAPITest
         effects                                  <- effectsForSimpleCasperSetup(blockStore, blockDagStorage)
         spanEff                                  = NoopSpan[Task]()
         (logEff, engineCell, cliqueOracleEffect) = effects
-        hash                                     = BlockHashOps(secondBlock.blockHash).base16String
+        hash                                     = secondBlock.blockHash.base16String
         blockQueryResponse <- BlockAPI.getBlock[Task](hash)(
                                Sync[Task],
                                engineCell,
@@ -90,11 +92,11 @@ class BlockQueryResponseAPITest
             )
             blockInfo.blockInfo match {
               case Some(b) =>
-                b.blockHash should be(BlockHashOps(secondBlock.blockHash).base16String)
-                b.sender should be(BlockHashOps(secondBlock.sender).base16String)
+                b.blockHash should be(secondBlock.blockHash.base16String)
+                b.sender should be(secondBlock.sender.base16String)
                 b.blockSize should be(secondBlock.toProto.serializedSize.toString)
                 b.seqNum should be(secondBlock.toProto.seqNum)
-                b.sig should be(BlockHashOps(secondBlock.sig).base16String)
+                b.sig should be(secondBlock.sig.base16String)
                 b.sigAlgorithm should be(secondBlock.sigAlgorithm)
                 b.shardId should be(secondBlock.toProto.shardId)
                 b.extraBytes should be(secondBlock.toProto.extraBytes)
@@ -102,14 +104,14 @@ class BlockQueryResponseAPITest
                 b.timestamp should be(secondBlock.header.timestamp)
                 b.headerExtraBytes should be(secondBlock.header.extraBytes)
                 b.parentsHashList should be(
-                  secondBlock.header.parentsHashList.map(BlockHashOps(_).base16String)
+                  secondBlock.header.parentsHashList.map(_.base16String)
                 )
                 b.blockNumber should be(secondBlock.body.state.blockNumber)
                 b.preStateHash should be(
-                  BlockHashOps(secondBlock.body.state.preStateHash).base16String
+                  secondBlock.body.state.preStateHash.base16String
                 )
                 b.postStateHash should be(
-                  BlockHashOps(secondBlock.body.state.postStateHash).base16String
+                  secondBlock.body.state.postStateHash.base16String
                 )
                 b.bodyExtraBytes should be(secondBlock.body.extraBytes)
                 b.bonds should be(secondBlock.body.state.bonds.map(ProtoUtil.bondToBondInfo))
@@ -212,11 +214,11 @@ class BlockQueryResponseAPITest
                              )
         _ = inside(blockQueryResponse) {
           case Right(blockInfo) =>
-            blockInfo.blockHash should be(BlockHashOps(secondBlock.toProto.blockHash).base16String)
-            blockInfo.sender should be(BlockHashOps(secondBlock.toProto.sender).base16String)
+            blockInfo.blockHash should be(secondBlock.toProto.blockHash.base16String)
+            blockInfo.sender should be(secondBlock.toProto.sender.base16String)
             blockInfo.blockSize should be(secondBlock.toProto.serializedSize.toString)
             blockInfo.seqNum should be(secondBlock.toProto.seqNum)
-            blockInfo.sig should be(BlockHashOps(secondBlock.sig).base16String)
+            blockInfo.sig should be(secondBlock.sig.base16String)
             blockInfo.sigAlgorithm should be(secondBlock.sigAlgorithm)
             blockInfo.shardId should be(secondBlock.toProto.shardId)
             blockInfo.extraBytes should be(secondBlock.toProto.extraBytes)
@@ -224,14 +226,14 @@ class BlockQueryResponseAPITest
             blockInfo.timestamp should be(secondBlock.header.timestamp)
             blockInfo.headerExtraBytes should be(secondBlock.header.extraBytes)
             blockInfo.parentsHashList should be(
-              secondBlock.header.parentsHashList.map(BlockHashOps(_).base16String)
+              secondBlock.header.parentsHashList.map(_.base16String)
             )
             blockInfo.blockNumber should be(secondBlock.body.state.blockNumber)
             blockInfo.preStateHash should be(
-              BlockHashOps(secondBlock.body.state.preStateHash).base16String
+              secondBlock.body.state.preStateHash.base16String
             )
             blockInfo.postStateHash should be(
-              BlockHashOps(secondBlock.body.state.postStateHash).base16String
+              secondBlock.body.state.postStateHash.base16String
             )
             blockInfo.bodyExtraBytes should be(secondBlock.body.extraBytes)
             blockInfo.bonds should be(secondBlock.body.state.bonds.map(ProtoUtil.bondToBondInfo))
@@ -273,7 +275,7 @@ class BlockQueryResponseAPITest
   ): Task[(LogStub[Task], EngineCell[Task], SafetyOracle[Task])] =
     runtimeManagerResource.use { implicit runtimeManager =>
       for {
-        _ <- blockDagStorage.insert(genesisBlock, false)
+        _ <- blockDagStorage.insert(genesisBlock, false, approved = true)
         _ <- blockDagStorage.insert(secondBlock, false)
         casperEffect <- NoOpsCasperEffect[Task](
                          HashMap[BlockHash, BlockMessage](
@@ -286,7 +288,7 @@ class BlockQueryResponseAPITest
         engine     = new EngineWithCasper[Task](casperEffect)
         engineCell <- Cell.mvarCell[Task, Engine[Task]](engine)
         cliqueOracleEffect = SafetyOracle
-          .cliqueOracle[Task](Sync[Task], logEff, metricsEff, spanEff)
+          .cliqueOracle[Task](Concurrent[Task], logEff, metricsEff, spanEff)
       } yield (logEff, engineCell, cliqueOracleEffect)
     }
 
@@ -302,12 +304,13 @@ class BlockQueryResponseAPITest
                            (secondBlock.blockHash, secondBlock)
                          )
                        )(Sync[Task], blockStore, blockDagStorage, runtimeManager)
+        _          <- blockDagStorage.insert(genesisBlock, invalid = false, approved = true)
         logEff     = new LogStub[Task]()
         metricsEff = new Metrics.MetricsNOP[Task]
         engine     = new EngineWithCasper[Task](casperEffect)
         engineCell <- Cell.mvarCell[Task, Engine[Task]](engine)
         cliqueOracleEffect = SafetyOracle
-          .cliqueOracle[Task](Sync[Task], logEff, metricsEff, spanEff)
+          .cliqueOracle[Task](Concurrent[Task], logEff, metricsEff, spanEff)
       } yield (logEff, engineCell, cliqueOracleEffect)
     }
 }

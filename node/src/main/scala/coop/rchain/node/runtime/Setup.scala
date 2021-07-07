@@ -5,14 +5,14 @@ import cats.effect.concurrent.{Deferred, Ref}
 import cats.effect.{Concurrent, ContextShift, Sync}
 import cats.mtl.ApplicativeAsk
 import cats.syntax.all._
-import com.google.protobuf.ByteString
+import coop.rchain.blockstorage.KeyValueBlockStore
 import coop.rchain.blockstorage.casperbuffer.CasperBufferKeyValueStorage
 import coop.rchain.blockstorage.dag.BlockDagKeyValueStorage
 import coop.rchain.blockstorage.deploy.LMDBDeployStorage
 import coop.rchain.blockstorage.finality.LastFinalizedKeyValueStorage
 import coop.rchain.blockstorage.util.io.IOError
-import coop.rchain.blockstorage.{BlockStore, FileLMDBIndexBlockStore, KeyValueBlockStore}
 import coop.rchain.casper._
+import coop.rchain.casper.api.BlockReportAPI
 import coop.rchain.casper.blocks.BlockProcessor
 import coop.rchain.casper.blocks.proposer.{Proposer, ProposerResult}
 import coop.rchain.casper.engine.{BlockRetriever, CasperLaunch, EngineCell, Running}
@@ -22,7 +22,6 @@ import coop.rchain.casper.storage.RNodeKeyValueStoreManager
 import coop.rchain.casper.storage.RNodeKeyValueStoreManager.legacyRSpacePathPrefix
 import coop.rchain.casper.util.comm.{CasperPacketHandler, CommUtil}
 import coop.rchain.casper.util.rholang.RuntimeManager
-import coop.rchain.catscontrib.Catscontrib._
 import coop.rchain.comm.rp.Connect.ConnectionsCell
 import coop.rchain.comm.rp.RPConf
 import coop.rchain.comm.transport.TransportLayer
@@ -32,20 +31,21 @@ import coop.rchain.metrics.{Metrics, Span}
 import coop.rchain.models.BlockHash.BlockHash
 import coop.rchain.models.{BindPattern, ListParWithRandom, Par, TaggedContinuation}
 import coop.rchain.monix.Monixable
-import coop.rchain.node.runtime.NodeRuntime._
 import coop.rchain.node.api.AdminWebApi.AdminWebApiImpl
 import coop.rchain.node.api.WebApi.WebApiImpl
 import coop.rchain.node.api.{AdminWebApi, WebApi}
 import coop.rchain.node.configuration.NodeConf
-import coop.rchain.node.state.instances.RNodeStateManagerImpl
 import coop.rchain.node.diagnostics
+import coop.rchain.node.runtime.NodeRuntime._
+import coop.rchain.node.state.instances.RNodeStateManagerImpl
+import coop.rchain.node.web.ReportingRoutes
+import coop.rchain.node.web.ReportingRoutes.ReportingHttpRoutes
 import coop.rchain.p2p.effects.PacketHandler
 import coop.rchain.rholang.interpreter.RhoRuntime
 import coop.rchain.rspace.state.instances.RSpaceStateManagerImpl
 import coop.rchain.rspace.syntax._
-import coop.rchain.rspace.{Context, Match, RSpace}
+import coop.rchain.rspace.{Match, RSpace}
 import coop.rchain.shared._
-import coop.rchain.store.LmdbDirStoreManager
 import fs2.concurrent.Queue
 import monix.execution.Scheduler
 
@@ -58,8 +58,6 @@ object Setup {
       commUtil: CommUtil[F],
       blockRetriever: BlockRetriever[F],
       conf: NodeConf,
-      blockstorePath: Path,
-      lastFinalizedPath: Path,
       eventPublisher: EventPublisher[F],
       deployStorageConfig: LMDBDeployStorage.Config
   )(implicit mainScheduler: Scheduler): F[
@@ -70,7 +68,7 @@ object Setup {
         CasperLoop[F],
         EngineInit[F],
         CasperLaunch[F],
-        ReportingCasper[F],
+        ReportingHttpRoutes[F],
         WebApi[F],
         AdminWebApi[F],
         Option[Proposer[F]],
@@ -97,22 +95,17 @@ object Setup {
       legacyRSpaceDirSupport <- Sync[F].delay(Files.exists(oldRSpacePath))
       rnodeStoreManager      <- RNodeKeyValueStoreManager(conf.storage.dataDir, legacyRSpaceDirSupport)
 
+      // TODO: Old BlockStore migration message, remove after couple of releases from v0.11.0.
+      oldBlockStoreExists = conf.storage.dataDir.resolve("blockstore/storage").toFile.exists
+      oldBlockStoreMsg    = s"""
+       |Old file-based block storage detected (blockstore/storage). To use this version of RNode please first do the migration.
+       |Migration should be done with RNode version v0.10.2. More info can be found in PR:
+       |https://github.com/rchain/rchain/pull/3342
+      """.stripMargin
+      _                   <- new Exception(oldBlockStoreMsg).raiseError.whenA(oldBlockStoreExists)
+
       // Block storage
-      blockStore <- {
-        // Check if old file based block store exists
-        val oldBlockStoreExists = blockstorePath.resolve("storage").toFile.exists
-        // TODO: remove file based block store in future releases
-        def oldStorage: F[BlockStore[F]] = {
-          val blockstoreEnv = Context.env(blockstorePath, LmdbDirStoreManager.tb)
-          for {
-            blockStore <- FileLMDBIndexBlockStore
-                           .create[F](blockstoreEnv, blockstorePath)
-                           .map(_.right.get) // TODO handle errors
-          } yield blockStore
-        }
-        // Start block storage
-        if (oldBlockStoreExists) oldStorage else KeyValueBlockStore(rnodeStoreManager)
-      }
+      blockStore <- KeyValueBlockStore(rnodeStoreManager)
 
       // Last finalized Block storage
       lastFinalizedStorage <- {
@@ -121,6 +114,13 @@ object Setup {
           lastFinalizedStore   = LastFinalizedKeyValueStorage(lastFinalizedBlockDb)
         } yield lastFinalizedStore
       }
+
+      // Migrate LastFinalizedStorage to BlockDagStorage
+      lfbMigration = Log[F].info("Migrating LastFinalizedStorage to BlockDagStorage.") *>
+        lastFinalizedStorage.migrateLfb(rnodeStoreManager, blockStore)
+      // Check if LFB is already migrated
+      lfbRequireMigration <- lastFinalizedStorage.requireMigration
+      _                   <- lfbMigration.whenA(lfbRequireMigration)
 
       // Block DAG storage
       blockDagStorage <- BlockDagKeyValueStorage.create[F](rnodeStoreManager)
@@ -138,13 +138,6 @@ object Setup {
         SafetyOracle.cliqueOracle[F]
       }
 
-      lastFinalizedBlockCalculator = {
-        implicit val bs = blockStore
-        implicit val da = blockDagStorage
-        implicit val or = oracle
-        implicit val ds = deployStorage
-        LastFinalizedBlockCalculator[F](conf.casper.faultToleranceThreshold)
-      }
       estimator = {
         implicit val sp = span
         Estimator[F](conf.casper.maxNumberOfParents, conf.casper.maxParentDepth)
@@ -155,7 +148,6 @@ object Setup {
       }
       lastFinalizedHeightConstraintChecker = {
         implicit val bs = blockStore
-        implicit val lf = lastFinalizedStorage
         LastFinalizedHeightConstraintChecker[F]
       }
       // runtime for `rnode eval`
@@ -195,22 +187,10 @@ object Setup {
                        .createRuntimes[F](rSpacePlay, rSpaceReplay, initRegistry = true, Seq.empty)
           (rhoRuntime, replayRhoRuntime) = runtimes
           reporter <- if (conf.apiServer.enableReporting) {
-                       import coop.rchain.rholang.interpreter.storage._
                        for {
                          // In reporting replay channels map is not needed
                          store <- rnodeStoreManager.rSpaceStores(useChannelsMap = false)
-                         reportingCache <- ReportMemStore
-                                            .store[
-                                              F,
-                                              Par,
-                                              BindPattern,
-                                              ListParWithRandom,
-                                              TaggedContinuation
-                                            ](rnodeStoreManager)
-                       } yield ReportingCasper.rhoReporter(
-                         reportingCache,
-                         store
-                       )
+                       } yield ReportingCasper.rhoReporter(store)
                      } else
                        ReportingCasper.noop.pure[F]
         } yield (rhoRuntime, replayRhoRuntime, reporter)
@@ -256,7 +236,6 @@ object Setup {
       proposer = validatorIdentityOpt.map { validatorIdentity =>
         implicit val rm         = runtimeManager
         implicit val bs         = blockStore
-        implicit val lf         = lastFinalizedStorage
         implicit val bd         = blockDagStorage
         implicit val sc         = synchronyConstraintChecker
         implicit val lfhscc     = lastFinalizedHeightConstraintChecker
@@ -294,14 +273,12 @@ object Setup {
       casperLaunch = {
         implicit val bs     = blockStore
         implicit val bd     = blockDagStorage
-        implicit val lf     = lastFinalizedStorage
         implicit val ec     = engineCell
         implicit val ev     = envVars
         implicit val re     = raiseIOError
         implicit val br     = blockRetriever
         implicit val rm     = runtimeManager
         implicit val or     = oracle
-        implicit val lc     = lastFinalizedBlockCalculator
         implicit val sp     = span
         implicit val lb     = lab
         implicit val rc     = rpConnections
@@ -339,6 +316,13 @@ object Setup {
           conf.roundRobinDispatcher.dropPeerAfterRetries
         )
       }*/
+      reportingStore <- ReportStore.store[F](rnodeStoreManager)
+      blockReportAPI = {
+        implicit val ec = engineCell
+        implicit val bs = blockStore
+        implicit val or = oracle
+        BlockReportAPI[F](reportingRuntime, reportingStore)
+      }
       apiServers = {
         implicit val bs = blockStore
         implicit val ec = engineCell
@@ -346,7 +330,6 @@ object Setup {
         implicit val sp = span
         implicit val sc = synchronyConstraintChecker
         implicit val lh = lastFinalizedHeightConstraintChecker
-        implicit val rc = reportingRuntime
         APIServers.build[F](
           evalRuntime,
           triggerProposeFOpt,
@@ -354,8 +337,12 @@ object Setup {
           conf.apiServer.maxBlocksLimit,
           conf.devMode,
           if (conf.autopropose && conf.dev.deployerPrivateKey.isDefined) triggerProposeFOpt
-          else none[ProposeFunction[F]]
+          else none[ProposeFunction[F]],
+          blockReportAPI
         )
+      }
+      reportingRoutes = {
+        ReportingRoutes.service[F](blockReportAPI)
       }
       casperLoop = {
         implicit val br = blockRetriever
@@ -413,7 +400,7 @@ object Setup {
       updateForkChoiceLoop,
       engineInit,
       casperLaunch,
-      reportingRuntime,
+      reportingRoutes,
       webApi,
       adminWebApi,
       proposer,

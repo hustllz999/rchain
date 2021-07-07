@@ -4,12 +4,12 @@ import cats._
 import cats.effect.concurrent.Ref
 import coop.rchain.blockstorage._
 import coop.rchain.blockstorage.casperbuffer.CasperBufferKeyValueStorage
-import coop.rchain.blockstorage.dag.{BlockDagRepresentation, InMemBlockDagStorage}
+import coop.rchain.blockstorage.dag.{BlockDagKeyValueStorage, BlockDagRepresentation}
 import coop.rchain.blockstorage.deploy.InMemDeployStorage
 import coop.rchain.blockstorage.finality.LastFinalizedMemoryStorage
 import coop.rchain.casper._
 import coop.rchain.casper.engine.BlockRetriever.RequestState
-import coop.rchain.casper.genesis.contracts.{Validator, Vault}
+import coop.rchain.casper.genesis.contracts.Validator
 import coop.rchain.casper.protocol._
 import coop.rchain.casper.util.comm.CommUtil
 import coop.rchain.casper.util.rholang.Resources.mkTestRNodeStoreManager
@@ -20,11 +20,10 @@ import coop.rchain.catscontrib.TaskContrib._
 import coop.rchain.comm._
 import coop.rchain.comm.rp.Connect.{Connections, ConnectionsCell}
 import coop.rchain.metrics.{Metrics, NoopSpan, Span}
-import coop.rchain.models.{BindPattern, ListParWithRandom, Match, Par, TaggedContinuation}
 import coop.rchain.models.BlockHash.BlockHash
+import coop.rchain.models.{BindPattern, ListParWithRandom, Par, TaggedContinuation}
 import coop.rchain.p2p.EffectsTestInstances._
 import coop.rchain.rholang.interpreter.RhoRuntime
-import coop.rchain.rholang.interpreter.util.RevAddress
 import coop.rchain.rspace.RSpace
 import coop.rchain.rspace.state.instances.RSpaceStateManagerImpl
 import coop.rchain.rspace.syntax.rspaceSyntaxKeyValueStoreManager
@@ -36,7 +35,6 @@ import monix.execution.Scheduler
 
 object Setup {
   def apply() = new {
-    import coop.rchain.rholang.interpreter.storage._
 
     implicit val log              = new LogStub[Task]
     implicit val eventLogStub     = new EventLogStub[Task]
@@ -115,11 +113,11 @@ object Setup {
       })
     implicit val lab =
       LastApprovedBlock.of[Task].unsafeRunSync(monix.execution.Scheduler.Implicits.global)
-    implicit val blockMap         = Ref.unsafe[Task, Map[BlockHash, BlockMessageProto]](Map.empty)
-    implicit val approvedBlockRef = Ref.unsafe[Task, Option[ApprovedBlock]](None)
-    implicit val blockStore       = InMemBlockStore.create[Task]
-    implicit val blockDagStorage = InMemBlockDagStorage
-      .create[Task]
+    val kvm = InMemoryStoreManager[Task]()
+    implicit val blockStore =
+      KeyValueBlockStore[Task](kvm).unsafeRunSync(monix.execution.Scheduler.Implicits.global)
+    implicit val blockDagStorage = BlockDagKeyValueStorage
+      .create(kvm)
       .unsafeRunSync(monix.execution.Scheduler.Implicits.global)
     implicit val lastFinalizedStorage = LastFinalizedMemoryStorage
       .make[Task]
@@ -133,7 +131,6 @@ object Setup {
           estimateBlockHash: BlockHash
       ): Task[Float] = Task.pure(1.0f)
     }
-    implicit val lastFinalizedBlockCalculator   = LastFinalizedBlockCalculator[Task](0f)
     implicit val estimator                      = Estimator[Task](Estimator.UnlimitedParents, None)
     implicit val synchronyConstraintChecker     = SynchronyConstraintChecker[Task]
     implicit val lastFinalizedConstraintChecker = LastFinalizedHeightConstraintChecker[Task]

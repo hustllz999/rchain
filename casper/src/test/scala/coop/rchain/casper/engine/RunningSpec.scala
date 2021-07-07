@@ -27,7 +27,8 @@ class RunningSpec extends WordSpec with BeforeAndAfterEach with Matchers {
     transportLayer.reset()
 
   "Running state" should {
-    val genesis                = GenesisBuilder.createGenesis()
+    val genesis = GenesisBuilder.createGenesis()
+    blockDagStorage.insert(genesis, false, approved = true).runSyncUnsafe()
     val approvedBlockCandidate = ApprovedBlockCandidate(block = genesis, requiredSigs = 0)
     val approvedBlock: ApprovedBlock = ApprovedBlock(
       candidate = approvedBlockCandidate,
@@ -108,14 +109,17 @@ class RunningSpec extends WordSpec with BeforeAndAfterEach with Matchers {
 
     "respond to ForkChoiceTipRequest messages" in {
       val request = ForkChoiceTipRequest
+      val block1  = getRandomBlock().copy(sender = ByteString.EMPTY)
+      val block2  = getRandomBlock().copy(sender = ByteString.EMPTY)
       val test: Task[Unit] = for {
-        tip  <- MultiParentCasper.forkChoiceTip[Task](casper)
-        _    <- engine.handle(local, request)
-        head = transportLayer.requests.head
-        _    = assert(head.peer == local)
-        _ = assert(
-          head.msg.message.packet.get == ToPacket(HasBlockProto(tip))
-        )
+        _        <- blockDagStorage.insert(block1, false)
+        _        <- blockDagStorage.insert(block2, false)
+        tips     <- casper.blockDag.flatMap(_.latestMessageHashes.map(_.values))
+        _        <- engine.handle(local, request)
+        requests = transportLayer.requests.map(_.msg.message.packet.get).toSet
+        expected = tips.map(tip => ToPacket(HasBlockProto(tip))).toSet
+        _        = assert(transportLayer.requests.head.peer == local)
+        _        = assert(requests == expected)
       } yield ()
 
       test.unsafeRunSync

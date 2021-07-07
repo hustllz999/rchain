@@ -1,11 +1,9 @@
 package coop.rchain.casper.util.rholang
 
-import cats.Applicative
 import cats.data.{EitherT, WriterT}
 import cats.effect.Sync
 import cats.syntax.all._
 import com.google.protobuf.ByteString
-import coop.rchain.casper.{CasperMetricsSource, PrettyPrinter}
 import coop.rchain.casper.protocol.ProcessedSystemDeploy.Failed
 import coop.rchain.casper.protocol.{
   Bond,
@@ -18,7 +16,7 @@ import coop.rchain.casper.protocol.{
   SlashSystemDeployData,
   SystemDeployData
 }
-import coop.rchain.casper.util.{ConstructDeploy, EventConverter}
+import coop.rchain.casper.util.rholang.InterpreterUtil.printDeployErrors
 import coop.rchain.casper.util.rholang.SystemDeployPlatformFailure.{
   ConsumeFailed,
   GasRefundFailure,
@@ -33,36 +31,29 @@ import coop.rchain.casper.util.rholang.costacc.{
   RefundDeploy,
   SlashDeploy
 }
+import coop.rchain.casper.util.{ConstructDeploy, EventConverter}
+import coop.rchain.casper.{CasperMetricsSource, PrettyPrinter}
 import coop.rchain.crypto.PublicKey
 import coop.rchain.crypto.codec.Base16
-import coop.rchain.rholang.interpreter.accounting.Cost
 import coop.rchain.crypto.signatures.{Secp256k1, Signed}
+import coop.rchain.metrics.implicits._
 import coop.rchain.metrics.{Metrics, Span}
 import coop.rchain.models.BlockHash.BlockHash
 import coop.rchain.models.Expr.ExprInstance.EVarBody
 import coop.rchain.models.Validator.Validator
 import coop.rchain.models.Var.VarInstance.FreeVar
+import coop.rchain.models._
 import coop.rchain.models.block.StateHash.StateHash
-import coop.rchain.models.{
-  BindPattern,
-  EVar,
-  Expr,
-  GPrivate,
-  ListParWithRandom,
-  NormalizerEnv,
-  Par,
-  TaggedContinuation,
-  Var
-}
-import coop.rchain.rholang.interpreter.RhoRuntime.{bootstrapRand, RuntimeMetricsSource}
+import coop.rchain.rholang.interpreter.RhoRuntime.{bootstrapRegistry, RuntimeMetricsSource}
 import coop.rchain.rholang.interpreter.SystemProcesses.BlockData
+import coop.rchain.rholang.interpreter.accounting.Cost
 import coop.rchain.rholang.interpreter.errors.BugFoundError
-import coop.rchain.rholang.interpreter.registry.RegistryBootstrap
 import coop.rchain.rholang.interpreter.{EvaluateResult, ReplayRhoRuntime, RhoRuntime}
+import coop.rchain.rspace.hashing.Blake2b256Hash
 import coop.rchain.rspace.history.History.emptyRootHash
-import coop.rchain.rspace.{trace, Blake2b256Hash, ReplayException}
+import coop.rchain.rspace.trace
+import coop.rchain.rspace.util.ReplayException
 import coop.rchain.shared.Log
-import coop.rchain.metrics.implicits._
 
 trait RhoRuntimeSyntax {
   implicit final def syntaxRuntime[F[_]: Sync: Span: Log](
@@ -95,20 +86,10 @@ final class RhoRuntimeOps[F[_]: Sync: Span: Log](
   def emptyStateHash: F[StateHash] =
     for {
       _          <- runtime.reset(emptyRootHash)
-      _          <- bootstrapRuntime
+      _          <- bootstrapRegistry(runtime)
       checkpoint <- runtime.createCheckpoint
       hash       = ByteString.copyFrom(checkpoint.root.bytes.toArray)
     } yield hash
-
-  def bootstrapRuntime: F[Unit] = {
-    implicit val rand = bootstrapRand
-    for {
-      cost <- runtime.cost.get
-      _    <- runtime.cost.set(Cost.UNSAFE_MAX)
-      _    <- runtime.inj(RegistryBootstrap.AST)
-      _    <- runtime.cost.set(cost)
-    } yield ()
-  }
 
   private def activateValidatorQuerySource: String =
     s"""
@@ -336,8 +317,8 @@ final class RhoRuntimeOps[F[_]: Sync: Span: Log](
         checkpoint.log.map(EventConverter.toCasperEvent).toList,
         errors.nonEmpty
       )
-      _ <- if (errors.nonEmpty) runtime.revertToSoftCheckpoint(fallback)
-          else Applicative[F].unit
+      _ <- (runtime.revertToSoftCheckpoint(fallback) <* printDeployErrors(deploy.sig, errors))
+            .whenA(errors.nonEmpty)
     } yield deployResult
   }
 
@@ -586,21 +567,22 @@ final class ReplayRhoRuntimeOps[F[_]: Sync: Span: Log](
   def replayDeploy(withCostAccounting: Boolean)(
       processedDeploy: ProcessedDeploy
   ): F[Option[ReplayFailure]] =
-    replayDeployE(withCostAccounting)(processedDeploy).flatMap(_.swap.value.map(_.toOption))
+    replayDeployE(withCostAccounting)(processedDeploy).swap.toOption.value
 
   def replayDeployE(withCostAccounting: Boolean)(
       processedDeploy: ProcessedDeploy
-  ): F[EitherT[F, ReplayFailure, Unit]] = {
+  ): EitherT[F, ReplayFailure, Unit] = {
     import processedDeploy._
     val deployEvaluator = EitherT
       .liftF {
         for {
-          fallback <- runtime.createSoftCheckpoint
-          result   <- rhoRuntimeOps.evaluate(deploy)
+          fallback  <- runtime.createSoftCheckpoint
+          result    <- rhoRuntimeOps.evaluate(deploy)
+          logErrors = printDeployErrors(processedDeploy.deploy.sig, result.errors)
           /* Since the state of `replaySpace` is reset on each invocation of `replayComputeState`,
             and `ReplayFailure`s mean that block processing is cancelled upstream, we only need to
             reset state if the replay effects of valid deploys need to be discarded. */
-          _ <- runtime.revertToSoftCheckpoint(fallback).whenA(result.failed)
+          _ <- (runtime.revertToSoftCheckpoint(fallback) <* logErrors).whenA(result.failed)
         } yield result
       }
       .ensureOr(
@@ -653,26 +635,26 @@ final class ReplayRhoRuntimeOps[F[_]: Sync: Span: Log](
       } else deployEvaluator.map(_.succeeded)
 
     for {
-      _ <- runtime.rig(processedDeploy.deployLog.map(EventConverter.toRspaceEvent))
-      failureOption = evaluatorT
-        .flatMap { succeeded =>
-          /* This deployment represents either correct program `Some(result)`,
+      _ <- EitherT.liftF(runtime.rig(processedDeploy.deployLog.map(EventConverter.toRspaceEvent)))
+      failureOption <- evaluatorT
+                        .flatMap { succeeded =>
+                          /* This deployment represents either correct program `Some(result)`,
 or we have a failed pre-charge (`None`) but we agree on that it failed.
 In both cases we want to check reply data and see if everything is in order */
-          runtime.checkReplayData.attemptT
-            .leftMap {
-              case replayException: ReplayException =>
-                ReplayFailure.unusedCOMMEvent(replayException)
-              case throwable => ReplayFailure.internalError(throwable)
-            }
-            .leftFlatMap {
-              case UnusedCOMMEvent(_) if !succeeded =>
-                // TODO: temp fix for replay error mismatch
-                // https://rchain.atlassian.net/browse/RCHAIN-3505
-                EitherT.rightT[F, ReplayFailure](())
-              case ex: ReplayFailure => EitherT.leftT[F, Unit](ex)
-            }
-        }
+                          runtime.checkReplayData.attemptT
+                            .leftMap {
+                              case replayException: ReplayException =>
+                                ReplayFailure.unusedCOMMEvent(replayException)
+                              case throwable => ReplayFailure.internalError(throwable)
+                            }
+                            .leftFlatMap {
+                              case UnusedCOMMEvent(_) if !succeeded =>
+                                // TODO: temp fix for replay error mismatch
+                                // https://rchain.atlassian.net/browse/RCHAIN-3505
+                                EitherT.rightT[F, ReplayFailure](())
+                              case ex: ReplayFailure => EitherT.leftT[F, Unit](ex)
+                            }
+                        }
     } yield failureOption
   }
 
@@ -731,21 +713,16 @@ In both cases we want to check reply data and see if everything is in order */
       } yield result
     }
 
-  def replaySystemDeployInternal(
-      systemDeploy: SystemDeploy,
-      processedSystemDeploy: ProcessedSystemDeploy
-  ): F[Option[ReplayFailure]] =
-    replaySystemDeployInternalE(systemDeploy, processedSystemDeploy).flatMap(
-      _.swap.value.map(_.toOption)
-    )
-
   def replaySystemDeployInternalE(
       systemDeploy: SystemDeploy,
       processedSystemDeploy: ProcessedSystemDeploy
-  ): F[EitherT[F, ReplayFailure, Unit]] = {
+  ): EitherT[F, ReplayFailure, Unit] = {
     val deployEvaluator = EitherT
       .liftF {
         for {
+          _ <- runtime.rig(
+                processedSystemDeploy.eventList.map(EventConverter.toRspaceEvent)
+              )
           fallback <- runtime.createSoftCheckpoint
           result   <- rhoRuntimeOps.evaluateSystemSource(systemDeploy)
           _        <- rhoRuntimeOps.consumeSystemResult(systemDeploy)
@@ -760,33 +737,33 @@ In both cases we want to check reply data and see if everything is in order */
         result => ReplayFailure.replayStatusMismatch(processedSystemDeploy.failed, result.failed)
       )(result => processedSystemDeploy.failed == result.failed)
 
-    Span[F].withMarks("replay-system-deploy") {
-      for {
-        _ <- runtime.rig(
-              processedSystemDeploy.eventList.map(EventConverter.toRspaceEvent)
-            )
-        failureOption = deployEvaluator
-          .semiflatMap { evalResult =>
-            runtime.createSoftCheckpoint
-              .whenA(evalResult.succeeded)
-          }
-          .flatMap { _ =>
-            /* This deployment represents either correct program `Some(result)`,
+    deployEvaluator
+      .semiflatMap { evalResult =>
+        runtime.createSoftCheckpoint
+          .whenA(evalResult.succeeded)
+      }
+      .flatMap { _ =>
+        /* This deployment represents either correct program `Some(result)`,
               or we have a failed pre-charge (`None`) but we agree on that it failed.
               In both cases we want to check reply data and see if everything is in order */
-            runtime.checkReplayData.attemptT.leftMap {
-              case replayException: ReplayException =>
-                ReplayFailure.unusedCOMMEvent(replayException)
-              case throwable => ReplayFailure.internalError(throwable)
-            }
-          }
-      } yield failureOption
-    }
+        runtime.checkReplayData.attemptT.leftMap {
+          case replayException: ReplayException =>
+            ReplayFailure.unusedCOMMEvent(replayException)
+          case throwable => ReplayFailure.internalError(throwable)
+        }
+      }
   }
 
   def replaySystemDeploy(
       blockData: BlockData
-  )(processedSystemDeploy: ProcessedSystemDeploy): F[Option[ReplayFailure]] = {
+  )(processedSystemDeploy: ProcessedSystemDeploy): F[Option[ReplayFailure]] =
+    Span[F].withMarks("replay-system-deploy")(
+      replaySystemDeployE(blockData)(processedSystemDeploy).swap.toOption.value
+    )
+
+  def replaySystemDeployE(
+      blockData: BlockData
+  )(processedSystemDeploy: ProcessedSystemDeploy): EitherT[F, ReplayFailure, Unit] = {
     import processedSystemDeploy._
     val sender = ByteString.copyFrom(blockData.sender.bytes)
     systemDeploy match {
@@ -797,13 +774,14 @@ In both cases we want to check reply data and see if everything is in order */
             issuerPublicKey,
             SystemDeployUtil.generateSlashDeployRandomSeed(sender, blockData.seqNum)
           )
-        replaySystemDeployInternal(slashDeploy, processedSystemDeploy)
+        replaySystemDeployInternalE(slashDeploy, processedSystemDeploy)
       case CloseBlockSystemDeployData =>
         val closeBlockDeploy = CloseBlockDeploy(
           SystemDeployUtil.generateCloseDeployRandomSeed(sender, blockData.seqNum)
         )
-        replaySystemDeployInternal(closeBlockDeploy, processedSystemDeploy)
-      case Empty => ReplayFailure.internalError(new Exception("Expected system deploy")).some.pure
+        replaySystemDeployInternalE(closeBlockDeploy, processedSystemDeploy)
+      case Empty =>
+        EitherT.leftT(ReplayFailure.internalError(new Exception("Expected system deploy")))
     }
   }
 }

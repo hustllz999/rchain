@@ -6,14 +6,13 @@ import cats.syntax.all._
 import coop.rchain.metrics.Span
 import coop.rchain.rspace.channelStore.ChannelStore
 import coop.rchain.rspace.channelStore.instances.ChannelStoreImpl
-import coop.rchain.rspace.internal._
-import coop.rchain.rspace.merger.StateMerger
+import coop.rchain.rspace.hashing.Blake2b256Hash
+import coop.rchain.rspace.serializers.ScodecSerialize.{DatumB, JoinsB, WaitingContinuationB}
 import coop.rchain.rspace.state.instances.{RSpaceExporterStore, RSpaceImporterStore}
 import coop.rchain.rspace.state.{RSpaceExporter, RSpaceImporter}
-import coop.rchain.rspace.{Blake2b256Hash, HotStoreAction, HotStoreTrieAction}
+import coop.rchain.rspace.{HotStoreAction, HotStoreTrieAction}
 import coop.rchain.shared.{Log, Serialize}
 import coop.rchain.store.{KeyValueStore, LazyAdHocKeyValueCache}
-import scodec.Codec
 
 /**
   * Pointer to data in history (Datums, Continuations or Joins)
@@ -26,9 +25,9 @@ final case class HistoryPointer(state: Blake2b256Hash, hash: Blake2b256Hash)
   * Cache of decoded values from history
   */
 final case class HistoryCache[F[_], C, P, A, K](
-    dtsCache: LazyAdHocKeyValueCache[F, HistoryPointer, Seq[RichDatum[A]]],
-    wksCache: LazyAdHocKeyValueCache[F, HistoryPointer, Seq[RichKont[P, K]]],
-    jnsCache: LazyAdHocKeyValueCache[F, HistoryPointer, Seq[RichJoin[C]]]
+    dtsCache: LazyAdHocKeyValueCache[F, HistoryPointer, Seq[DatumB[A]]],
+    wksCache: LazyAdHocKeyValueCache[F, HistoryPointer, Seq[WaitingContinuationB[P, K]]],
+    jnsCache: LazyAdHocKeyValueCache[F, HistoryPointer, Seq[JoinsB[C]]]
 )
 
 trait HistoryRepository[F[_], C, P, A, K] extends ChannelStore[F, C] {
@@ -44,9 +43,9 @@ trait HistoryRepository[F[_], C, P, A, K] extends ChannelStore[F, C] {
 
   def importer: F[RSpaceImporter[F]]
 
-  def stateMerger: StateMerger[F]
+  def getHistoryReader(stateHash: Blake2b256Hash): HistoryReader[F, Blake2b256Hash, C, P, A, K]
 
-  def getHistoryReader(stateHash: Blake2b256Hash): HashHistoryReader[F, C, P, A, K]
+  def getSerializeC: Serialize[C]
 
   def root: Blake2b256Hash
 }
@@ -59,11 +58,11 @@ object HistoryRepositoryInstances {
       coldKeyValueStore: KeyValueStore[F],
       channelKeyValueStore: KeyValueStore[F]
   )(
-      implicit codecC: Codec[C],
-      codecP: Codec[P],
-      codecA: Codec[A],
-      codecK: Codec[K],
-      sc: Serialize[C]
+      implicit
+      sc: Serialize[C],
+      sp: Serialize[P],
+      sa: Serialize[A],
+      sk: Serialize[K]
   ): F[HistoryRepository[F, C, P, A, K]] = {
     // Roots store
     val rootsRepository = new RootRepository[F](
@@ -79,7 +78,7 @@ object HistoryRepositoryInstances {
       // RSpace importer/exporter / directly operates on Store (lmdb)
       exporter     = RSpaceExporterStore[F](historyKeyValueStore, coldKeyValueStore, rootsKeyValueStore)
       importer     = RSpaceImporterStore[F](historyKeyValueStore, coldKeyValueStore, rootsKeyValueStore)
-      channelStore = ChannelStoreImpl(channelKeyValueStore, sc, codecC)
+      channelStore = ChannelStoreImpl(channelKeyValueStore, sc)
     } yield HistoryRepositoryImpl[F, C, P, A, K](
       history,
       rootsRepository,
@@ -87,7 +86,10 @@ object HistoryRepositoryInstances {
       exporter,
       importer,
       channelStore,
-      sc
+      sc,
+      sp,
+      sa,
+      sk
     )
   }
 }

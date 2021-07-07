@@ -199,6 +199,7 @@ class GenesisTest extends FlatSpec with Matchers with EitherValues with BlockDag
           implicit val logEff = log
           for {
             genesis <- fromInputFiles()(runtimeManager, genesisPath, log, time)
+            _       <- blockDagStorage.insert(genesis, false, approved = true)
             _       <- BlockStore[Task].put(genesis.blockHash, genesis)
             dag     <- blockDagStorage.getRepresentation
             maybePostGenesisStateHash <- InterpreterUtil
@@ -255,7 +256,8 @@ object GenesisTest {
       quarantineLength: Int = 50000,
       numberOfActiveValidators: Int = 100,
       shardId: String = rchainShardId,
-      deployTimestamp: Option[Long] = Some(System.currentTimeMillis())
+      deployTimestamp: Option[Long] = Some(System.currentTimeMillis()),
+      blockNumber: Long = 0
   )(
       implicit runtimeManager: RuntimeManager[Task],
       genesisPath: Path,
@@ -286,7 +288,8 @@ object GenesisTest {
                            validators = validators
                          ),
                          vaults = vaults,
-                         supply = Long.MaxValue
+                         supply = Long.MaxValue,
+                         blockNumber = blockNumber
                        )
                      )
     } yield genesisBlock
