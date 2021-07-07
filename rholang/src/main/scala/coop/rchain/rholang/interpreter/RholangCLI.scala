@@ -34,7 +34,7 @@ object RholangCLI {
     version("Rholang Mercury 0.2")
     banner("""Options:""")
 
-    val binary             = opt[Boolean](descr = "outputs binary protobuf serialization")
+    val binary1             = opt[Boolean](descr = "outputs binary protobuf serialization")
     val text               = opt[Boolean](descr = "outputs textual protobuf serialization")
     val quiet              = opt[Boolean](descr = "don't print tuplespace after evaluation")
     val unmatchedSendsOnly = opt[Boolean](descr = "only print unmatched sends after evaluation")
